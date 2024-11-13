@@ -2,6 +2,7 @@
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### ####
 ## -This is a fork from 
 ## - https://gist.github.com/NorkzYT/14449b247dae9ac81ba4664564669299
+## - https://forum.proxmox.com/threads/tutorial-unprivileged-lxcs-mount-cifs-shares.101795/
 #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### #### ####
 # This script is designed to assist in mounting CIFS/SMB shares to a Proxmox LXC container.
 # It automates the process of creating a mount point on the Proxmox VE (PVE) host, adding the
