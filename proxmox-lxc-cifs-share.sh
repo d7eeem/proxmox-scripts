@@ -38,6 +38,20 @@ read -sp "Enter SMB password: " smb_password && echo
 read -p "Enter the LXC ID: " lxc_id
 read -p "Enter the username within the LXC that needs access to the share (e.g., jellyfin, plex): " lxc_username
 
+# Validate permissions format
+read -p "Enter the required file permissions (e.g., 0770): " file_permissions
+[[ "$file_permissions" =~ ^[0-7]{3,4}$ ]] || { echo "Invalid file permissions format"; exit 1; }
+
+read -p "Enter the required dir permissions (e.g., 0770): " dir_permissions
+[[ "$dir_permissions" =~ ^[0-7]{3,4}$ ]] || { echo "Invalid directory permissions format"; exit 1; }
+
+# Validate read-only option
+read -p "Is the mount read-only? (Y/n): " read_only
+if [[ ! "$read_only" =~ ^[YyNn]$ ]]; then
+    echo "Invalid input for read-only option. Please enter Y or N."
+    exit 1
+fi
+
 # Step 1: Configure LXC
 echo "Creating group 'lxc_shares' with GID=10000 in LXC..."
 pct exec $lxc_id -- groupadd -g 10000 lxc_shares
@@ -55,34 +69,33 @@ while [ "$(pct status $lxc_id)" != "status: stopped" ]; do
 done
 
 # Step 2: Configure PVE host
-# Create mount point
 echo "Creating mount point on PVE host..."
 mkdir -p /mnt/lxc_shares/$folder_name
 
-# Check if the fstab entry exists
-fstab_entry="//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name} cifs _netdev,x-systemd.automount,noatime,nobrl,uid=100000,gid=110000,dir_mode=0770,file_mode=0770,username=${smb_username},password=${smb_password} 0 0"
+# Prepare fstab entry
+fstab_entry="//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name} cifs _netdev,x-systemd.automount,noatime,nobrl,uid=100000,gid=110000,dir_mode=${dir_permissions},file_mode=${file_permissions},username=${smb_username},password=${smb_password} 0 0"
+
+# Add to /etc/fstab if not already present
 if ! grep -q "//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name}" /etc/fstab ; then
-    echo "Adding NAS CIFS share to /etc/fstab with nobrl option..."
+    echo "Adding CIFS share to /etc/fstab..."
     echo "$fstab_entry" >> /etc/fstab
 else
-    echo "Entry for ${cifs_host}/${share_name} on /mnt/lxc_shares/${folder_name} already exists in /etc/fstab."
+    echo "Entry for ${cifs_host}/${share_name} on /mnt/lxc_shares/${folder_name} already exists."
 fi
 
-# Reload systemd to recognize changes to fstab
-echo "Reloading systemd daemon to apply fstab changes..."
+# Reload systemd and mount the share
+echo "Reloading systemd daemon..."
 systemctl daemon-reload
 
-# Before mounting, ensure the mount point is not already in use
 if mountpoint -q "/mnt/lxc_shares/$folder_name"; then
     echo "Unmounting the already mounted share to avoid conflicts..."
     umount -l "/mnt/lxc_shares/$folder_name"
 fi
 
-# Mount the share
 echo "Mounting the share on the PVE host..."
 mount "/mnt/lxc_shares/$folder_name"
 
-# Add a bind mount of the share to the LXC config
+# Add bind mount to LXC config
 echo "Determining the next available mount point index..."
 config_file="/etc/pve/lxc/${lxc_id}.conf"
 if [ -f "$config_file" ]; then
@@ -93,7 +106,11 @@ else
 fi
 
 echo "Adding a bind mount of the share to the LXC config..."
-lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}"
+if [[ "$read_only" =~ [Yy] ]]; then
+   lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}:ro"
+else
+   lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}"
+fi
 echo "$lxc_config_entry" >> "$config_file"
 
 # Step 3: Start the LXC
