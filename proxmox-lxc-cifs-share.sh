@@ -24,77 +24,113 @@
 #
 # Note: This script must be run as root to modify system files and perform mount operations.
 
+
 # Ensure the script is run as root
 if [[ $EUID -ne 0 ]]; then
-   echo "This script must be run as root"
-   exit 1
+    echo "This script must be run as root"
+    exit 1
+fi
+
+# Logging setup
+log_file="/var/log/lxc_mount_setup.log"
+exec > >(tee -i "$log_file") 2>&1
+
+# Check for `pct` command
+if ! command -v pct &>/dev/null; then
+    echo "Proxmox 'pct' command not found. Ensure this script is run on a Proxmox host."
+    exit 1
 fi
 
 # Ask user for necessary inputs
-read -p "Enter the folder name (e.g., nas_rwx): " folder_name
-read -p "Enter the CIFS hostname or IP (e.g., NAS): " cifs_host
-read -p "Enter the share name (e.g., media): " share_name
-read -p "Enter SMB username: " smb_username
-read -sp "Enter SMB password: " smb_password && echo
-read -p "Enter the LXC ID: " lxc_id
-read -p "Enter the username within the LXC that needs access to the share (e.g., jellyfin, plex): " lxc_username
+read -r -p "Enter the folder name (e.g., nas_rwx): " folder_name
+read -r -p "Enter the CIFS hostname or IP (e.g., NAS): " cifs_host
+read -r -p "Enter the share name (e.g., media): " share_name
+read -r -p "Enter SMB username: " smb_username
+read -r -sp "Enter SMB password: " smb_password && echo
+read -r -p "Enter the LXC ID: " lxc_id
+read -r -p "Enter the username within the LXC that needs access to the share (e.g., jellyfin, plex): " lxc_username
+
+# Check if the LXC container is running
+lxc_status=$(pct status "$lxc_id" | awk '{print $2}')
+if [[ "$lxc_status" != "running" ]]; then
+    echo "The LXC container $lxc_id is not running. Starting it..."
+    pct start "$lxc_id" || { echo "Failed to start the LXC container. Exiting."; exit 1; }
+    echo "Waiting for the LXC container $lxc_id to start..."
+    while [[ "$(pct status "$lxc_id" | awk '{print $2}')" != "running" ]]; do
+        sleep 1
+    done
+    echo "The LXC container $lxc_id is now running."
+else
+    echo "The LXC container $lxc_id is already running."
+fi
 
 # Validate permissions format
-read -p "Enter the required file permissions (e.g., 0770): " file_permissions
+read -r -p "Enter the required file permissions (default: 0770): " file_permissions
+file_permissions=${file_permissions:-0770}
 [[ "$file_permissions" =~ ^[0-7]{3,4}$ ]] || { echo "Invalid file permissions format"; exit 1; }
 
-read -p "Enter the required dir permissions (e.g., 0770): " dir_permissions
+read -r -p "Enter the required dir permissions (default: 0770): " dir_permissions
+dir_permissions=${dir_permissions:-0770}
 [[ "$dir_permissions" =~ ^[0-7]{3,4}$ ]] || { echo "Invalid directory permissions format"; exit 1; }
 
 # Validate read-only option
-read -p "Is the mount read-only? (Y/n): " read_only
+read -r -p "Is the mount read-only? (Y/n): " read_only
 if [[ ! "$read_only" =~ ^[YyNn]$ ]]; then
     echo "Invalid input for read-only option. Please enter Y or N."
     exit 1
 fi
 
+# Secure credentials file
+credentials_file="/root/.smbcredentials_$folder_name"
+echo "Creating credentials file at $credentials_file..."
+{
+    echo "username=$smb_username"
+    echo "password=$smb_password"
+} > "$credentials_file"
+chmod 600 "$credentials_file"
+
+# Prepare fstab entry
+fstab_entry="//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name} cifs _netdev,x-systemd.automount,noatime,nobrl,uid=100000,gid=110000,dir_mode=${dir_permissions},file_mode=${file_permissions},credentials=${credentials_file} 0 0"
+
 # Step 1: Configure LXC
 echo "Creating group 'lxc_shares' with GID=10000 in LXC..."
-pct exec $lxc_id -- groupadd -g 10000 lxc_shares
+pct exec "$lxc_id" -- groupadd -g 10000 lxc_shares || { echo "Failed to create group in LXC"; exit 1; }
 
 echo "Adding user $lxc_username to group 'lxc_shares'..."
-pct exec $lxc_id -- usermod -aG lxc_shares $lxc_username
+pct exec "$lxc_id" -- usermod -aG lxc_shares "$lxc_username" || { echo "Failed to add user to group in LXC"; exit 1; }
 
 echo "Shutting down the LXC..."
-pct stop $lxc_id
+pct stop "$lxc_id" || { echo "Failed to stop the LXC"; exit 1; }
 
 # Wait for the LXC to stop
-while [ "$(pct status $lxc_id)" != "status: stopped" ]; do
-  echo "Waiting for LXC $lxc_id to stop..."
-  sleep 1
+while [ "$(pct status "$lxc_id")" != "status: stopped" ]; do
+    echo "Waiting for LXC $lxc_id to stop..."
+    sleep 1
 done
 
 # Step 2: Configure PVE host
 echo "Creating mount point on PVE host..."
-mkdir -p /mnt/lxc_shares/$folder_name
-
-# Prepare fstab entry
-fstab_entry="//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name} cifs _netdev,x-systemd.automount,noatime,nobrl,uid=100000,gid=110000,dir_mode=${dir_permissions},file_mode=${file_permissions},username=${smb_username},password=${smb_password} 0 0"
+mkdir -p /mnt/lxc_shares/"$folder_name" || { echo "Failed to create mount point. Exiting."; exit 1; }
 
 # Add to /etc/fstab if not already present
-if ! grep -q "//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name}" /etc/fstab ; then
+if ! grep -q "//${cifs_host}/${share_name} /mnt/lxc_shares/${folder_name}" /etc/fstab; then
     echo "Adding CIFS share to /etc/fstab..."
-    echo "$fstab_entry" >> /etc/fstab
+    echo "$fstab_entry" >> /etc/fstab || { echo "Failed to write to /etc/fstab"; exit 1; }
 else
-    echo "Entry for ${cifs_host}/${share_name} on /mnt/lxc_shares/${folder_name} already exists."
+    echo "Entry for ${cifs_host}/${share_name} already exists in /etc/fstab."
 fi
 
 # Reload systemd and mount the share
 echo "Reloading systemd daemon..."
-systemctl daemon-reload
+systemctl daemon-reload || { echo "Systemd reload failed"; exit 1; }
 
 if mountpoint -q "/mnt/lxc_shares/$folder_name"; then
     echo "Unmounting the already mounted share to avoid conflicts..."
-    umount -l "/mnt/lxc_shares/$folder_name"
+    umount -l "/mnt/lxc_shares/$folder_name" || { echo "Failed to unmount existing share"; exit 1; }
 fi
 
 echo "Mounting the share on the PVE host..."
-mount "/mnt/lxc_shares/$folder_name"
+mount "/mnt/lxc_shares/$folder_name" || { echo "Failed to mount the share"; exit 1; }
 
 # Add bind mount to LXC config
 echo "Determining the next available mount point index..."
@@ -108,14 +144,14 @@ fi
 
 echo "Adding a bind mount of the share to the LXC config..."
 if [[ "$read_only" =~ [Yy] ]]; then
-   lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}:ro"
+    lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}:ro"
 else
-   lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}"
+    lxc_config_entry="mp${next_mp_index}: /mnt/lxc_shares/${folder_name},mp=/mnt/${folder_name}"
 fi
-echo "$lxc_config_entry" >> "$config_file"
+echo "$lxc_config_entry" >> "$config_file" || { echo "Failed to update LXC config"; exit 1; }
 
 # Step 3: Start the LXC
 echo "Starting the LXC..."
-pct start $lxc_id
+pct start "$lxc_id" || { echo "Failed to start the LXC"; exit 1; }
 
-echo "Configuration complete."
+echo "Configuration complete. Logs are available at $log_file."
